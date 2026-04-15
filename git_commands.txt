@@ -1,0 +1,18 @@
+first time 
+empty folder -> git init
+git config -- global user.email ""
+git config -- global user.name  ""
+
+///git remote add origin <url>
+
+git clone https://github.com/VARUNg4059/JUGAD-GARUDA-.git
+
+regular
+git checkout -b test
+git add .
+git commit -m "Message"
+git push origin test
+
+
+
+
