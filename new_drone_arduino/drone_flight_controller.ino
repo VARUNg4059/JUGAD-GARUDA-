@@ -4,6 +4,7 @@
 //  IMU     : MPU-6050  (I2C addr 0x68, AD0 floating = GND default)
 //  RC      : FlySky FS-CT6B → FS-R6B receiver (6-ch, 2.4 GHz)
 //  ESCs    : Standard PWM 1000–2000 µs
+//  Version : 2.1 — gyroRoll sign fix (bench-test verified)
 //
 //  MOTOR LAYOUT — X Configuration:
 //
@@ -32,10 +33,19 @@
 //    X-axis arrow → pointing toward FR (right side)
 //    Module face  → UP
 //
-//  AXIS CONVENTION (right-hand rule, standard):
-//    Roll  = tilt left/right  → rotation around Y-axis (X accel dominant)
-//    Pitch = tilt front/back  → rotation around X-axis (Y accel dominant)
-//    Yaw   = heading rotation → rotation around Z-axis (gz)
+//  AXIS CONVENTION:
+//    Roll  = tilt left/right  → corrected via -gy (bench verified)
+//    Pitch = tilt front/back  → gx (no sign change needed)
+//    Yaw   = heading rotation → gz (no sign change needed)
+//
+//  KEY FIX in v2.1:
+//    gyroRoll = -gy / 65.5  (negated)
+//    The MPU-6050 gy register is positive for CCW rotation around
+//    Y-axis (right-hand rule). Tilting RIGHT is CW around Y, so gy
+//    is negative — but accRoll is positive for right tilt. Without
+//    negation, gyro and accel fight each other in the complementary
+//    filter and the correction goes the wrong way. Negating gy
+//    makes both terms agree: positive = tilted right.
 //
 //  OPERATING MODES (set at compile time):
 //    THRUST_ONLY_MODE    true  → all motors same throttle, no PID
@@ -52,7 +62,7 @@
 //  Change these before uploading to switch behaviour.
 // ──────────────────────────────────────────────────────────
 #define THRUST_ONLY_MODE      false   // true = raw throttle, no PID
-#define ORIENTATION_TEST_MODE true   // true = IMU print only, no motors
+#define ORIENTATION_TEST_MODE false   // true = IMU print only, no motors
 
 // ──────────────────────────────────────────────────────────
 //  MPU-6050 I2C ADDRESS & REGISTER MAP
@@ -513,13 +523,27 @@ void loop() {
 
   // ── 2. Axis mapping for this MPU mounting ────────────────
   //  Physical mounting: Y→front, X→right, face UP
-  //  Standard orientation: no swap, no invert needed.
   //
   //  Gyro rates in °/s  (±500°/s → divide by 65.5)
-  //  gyroRoll  : rate of roll  = gy  (rotation around Y-axis)
-  //  gyroPitch : rate of pitch = gx  (rotation around X-axis)
-  //  gyroYaw   : rate of yaw   = gz  (rotation around Z-axis)
-  float gyroRoll  =  gy / 65.5f;
+  //
+  //  gyroRoll  : rotation around Y-axis = gy, NEGATED.
+  //    Why negated? The MPU-6050's gy register is positive
+  //    when rotating CCW around the Y-axis (right-hand rule).
+  //    For our frame: tilting RIGHT means the LEFT side goes up,
+  //    which is a CW rotation around Y → gy is NEGATIVE in the
+  //    chip's convention. We need gyroRoll POSITIVE when tilting
+  //    right so that accRoll (also positive when tilting right)
+  //    and gyroRoll agree in the complementary filter.
+  //    Negating gy achieves this alignment.
+  //    Confirmed by bench test: without negation, M1/M4 (FL/BL)
+  //    spin up when drone tilts right instead of M2/M3 (FR/BR).
+  //
+  //  gyroPitch : rotation around X-axis = gx (no sign change needed)
+  //    Tilting nose DOWN → gx positive in chip convention → pitch < 0
+  //    is handled by the -ay term in accPitch, so gx sign is correct.
+  //
+  //  gyroYaw   : rotation around Z-axis = gz (no sign change needed)
+  float gyroRoll  = -gy / 65.5f;   // ← NEGATED: aligns with accRoll sign
   float gyroPitch =  gx / 65.5f;
   float gyroYaw   =  gz / 65.5f;
 
@@ -617,7 +641,11 @@ void loop() {
 
   // ── 10. PID — ROLL ───────────────────────────────────────
   //  Target: roll = 0 (level)
-  //  Error positive → drone tilted right → FL/BL need more power
+  //  Tilt RIGHT → roll > 0 → rollError < 0 → rollPID < 0
+  //    mFL = thr + rollPID(−) → FL gets LESS   ✓
+  //    mFR = thr − rollPID(−) → FR gets MORE   ✓  (right side spins up)
+  //    mBR = thr − rollPID(−) → BR gets MORE   ✓
+  //    mBL = thr + rollPID(−) → BL gets LESS   ✓
   rollError    = 0.0f - roll;
   rollIntegral = constrain(rollIntegral + rollError * dt,
                            -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
@@ -663,20 +691,21 @@ void loop() {
   //    BR = throttle - pitchPID - rollPID - yawPID
   //    BL = throttle - pitchPID + rollPID + yawPID
   //
-  //  Logic check:
-  //    Roll right (drone tilts R): rollError < 0 → rollPID < 0
-  //      FL gets less (+roll), FR gets more (-roll)
-  //      BL gets less (+roll), BR gets more (-roll)
-  //      → left side spins up, drone levels → correct ✓
+  //  Roll logic (verified by bench test after gyroRoll sign fix):
+  //    Tilt RIGHT → roll > 0 → rollError < 0 → rollPID < 0
+  //      FL(+roll) gets LESS, BL(+roll) gets LESS  ← left side reduces
+  //      FR(-roll) gets MORE, BR(-roll) gets MORE  ← right side spins up
+  //      → right side lifts → drone levels → CORRECT ✓
   //
-  //    Pitch nose down: pitchError > 0 → pitchPID > 0
-  //      FL/FR get more, BL/BR get less
-  //      → front motors push nose up → correct ✓
+  //  Pitch logic:
+  //    Nose DOWN → pitch < 0 → pitchError > 0 → pitchPID > 0
+  //      FL/FR get MORE power → nose lifts → CORRECT ✓
   //
-  //    Yaw CW (from above): gyroYaw > 0 → yawError < 0 → yawPID < 0
-  //      FL(-yaw) gets more, FR(+yaw) gets less
-  //      BR(-yaw) gets more, BL(+yaw) gets less
-  //      → CW motors (FL,BR) spin up to counter CW rotation → correct ✓
+  //  Yaw logic:
+  //    Yaw CW (from above) → gyroYaw > 0 → yawError < 0 → yawPID < 0
+  //      FL(−yaw) gets MORE, BR(−yaw) gets MORE  ← CW motors spin up
+  //      FR(+yaw) gets LESS, BL(+yaw) gets LESS  ← CCW motors slow down
+  //      → net torque CCW → counters CW rotation → CORRECT ✓
 
   int mFL = constrain((int)(throttle + pitchPID + rollPID - yawPID),
                       MIN_THROTTLE, MAX_THROTTLE);

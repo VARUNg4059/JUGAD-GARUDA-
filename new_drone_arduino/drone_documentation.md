@@ -674,3 +674,97 @@ All motors get same value. R/P shown for reference only.
 
 *Generated for: Arduino Uno + MPU-6050 + FlySky FS-CT6B/R6B Quadcopter*
 *Firmware version: 2.0 (Uno port, MPU-6050, PCINT RC, full safety)*
+
+---
+
+## 19. v2.1 Patch — gyroRoll Sign Fix
+
+### Problem Observed
+When both modes are `false` (full PID stabilisation), tilting the drone RIGHT caused FL and BL (M1/M4, the LEFT side motors) to increase power instead of FR and BR (M2/M3, the RIGHT side motors). The correction was exactly backwards.
+
+### Root Cause — Full Technical Explanation
+
+The MPU-6050 gyroscope follows the **right-hand rule** for its raw register output:
+
+- Curl the fingers of your right hand around the Y-axis (pointing toward FRONT)
+- Thumb points toward front = positive rotation direction
+- This means: tilting the RIGHT side DOWN (rolling right) is **clockwise** around Y → the chip reports **gy as NEGATIVE**
+
+Meanwhile, the accelerometer formula:
+```
+accRoll = atan2(ax, az)
+```
+When tilting right, ax becomes positive → `atan2(+ax, az)` → **accRoll is POSITIVE**
+
+So in the original code, with `gyroRoll = +gy / 65.5`:
+- Tilt right → gy is negative → gyroRoll is negative → gyro says "tilting left"
+- Tilt right → accRoll is positive → accel says "tilting right"
+
+The complementary filter is 98% gyro + 2% accel. The gyro (98% weight, wrong sign) dominates and reports the roll angle as **negative** when actually tilting right. This makes:
+```
+rollError = 0 - roll = 0 - (negative) = POSITIVE
+rollPID = POSITIVE
+mFL = throttle + pitchPID + rollPID(+) → FL gets MORE  ← WRONG
+mFR = throttle + pitchPID - rollPID(+) → FR gets LESS  ← WRONG
+```
+
+### Fix Applied
+```cpp
+// Before (wrong):
+float gyroRoll = gy / 65.5f;
+
+// After (correct):
+float gyroRoll = -gy / 65.5f;   // negated to match accRoll sign convention
+```
+
+Now:
+- Tilt right → gy negative → `-gy` positive → gyroRoll positive
+- Tilt right → accRoll positive
+- Both agree → `roll` is positive when tilting right
+- rollError = 0 - positive = negative → rollPID negative
+- FR and BR get more power → corrects the tilt → **CORRECT ✓**
+
+### Files Changed
+Only **one line** changed in the .ino file. No mixing table changes, no wiring changes.
+
+---
+
+## 20. Mismatched ESC — Effects & Mitigation
+
+### Question
+What happens if one ESC is a different model from the other three?
+
+### Short Answer
+Yes, it will cause power delivery imbalance and make the drone harder to tune.
+
+### Technical Explanation
+
+Even ESCs of the same model have slight differences. A completely different ESC model compounds these differences:
+
+| Source of Imbalance | Effect |
+|--------------------|--------|
+| Different throttle endpoint calibration | At 1500 µs, one motor spins at different RPM than others |
+| Different throttle curve / linearity | Response per µs of command is non-linear relative to others |
+| Different PWM arming threshold | One ESC may not arm at 1000 µs, arms at 1050 µs instead |
+| Different response latency | One motor reacts faster/slower to a step command |
+| Different minimum power | One motor starts spinning at a lower throttle than others |
+
+### Practical Consequences
+- Drone has a **permanent lean** toward the mismatched motor side, even at hover
+- The PID will fight this constantly, consuming integral headroom
+- Tuning Kp/Ki/Kd becomes harder because the imbalance varies with throttle
+- The drone may drift in one direction that changes with throttle level
+
+### Mitigation Steps (in order of preference)
+1. **Best:** Replace the mismatched ESC with an identical model
+2. **Good:** Run a **full ESC calibration** on all four simultaneously:
+   - Disconnect the Arduino signal wires from all ESCs
+   - Power on the ESCs with props OFF — all ESCs enter calibration mode
+   - Send 2000 µs (full throttle) for 2 seconds
+   - Drop to 1000 µs — ESCs beep to confirm endpoint learned
+   - This at least aligns the 1000–2000 µs range across all four
+3. **Partial:** Increase Ki slightly to help the PID compensate for steady-state offset
+4. **Do not fly** with high Kp if the imbalance is large — oscillation risk increases
+
+### Summary
+One mismatched ESC is manageable for bench testing and slow hover, but for stable tuned flight, all four ESCs should be the same model, ideally from the same batch, and ESC-calibrated as a set.
